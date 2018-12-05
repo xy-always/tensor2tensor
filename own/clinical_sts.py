@@ -171,9 +171,6 @@ class RealL2LossModality(modality.Modality):
   def top(self, body_output, _):
     with tf.variable_scope("real"):
       output = tf.layers.dense(body_output, self._vocab_size, name="top")
-      print('FINAL OUTPUT')
-      print(output)
-      print('FINAL OUTPUT END')
       return output
 
   def loss(self, top_out, targets):
@@ -340,3 +337,9 @@ class Clinical(TextSimilarityProblem):
       filename = os.path.join(data_dir, f)
       for example in self.example_generator(filename):
         yield example
+
+  def eval_metrics(self):
+    eval_metrics = [
+      metrics.Metrics.EDIT_DISTANCE
+    ]
+    return eval_metrics
