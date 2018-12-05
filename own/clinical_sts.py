@@ -13,12 +13,174 @@ from tensor2tensor.data_generators import generator_utils
 from tensor2tensor.data_generators import problem
 from tensor2tensor.data_generators import text_problems
 from tensor2tensor.data_generators import text_encoder
-from tensor2tensor.layers import modalities
+from tensor2tensor.utils import modality
 from tensor2tensor.utils import metrics
 from tensor2tensor.utils import mlperf_log
 from tensor2tensor.utils import registry
 
 import tensorflow as tf
+
+class SymbolModality(modality.Modality):
+  """Modality for sets of discrete symbols.
+
+  Input:
+    Embedding.
+
+  Output:
+    Linear transformation + softmax.
+  """
+
+  @property
+  def name(self):
+    return "symbol_modality_%d_%d" % (self._vocab_size, self._body_input_depth)
+
+  @property
+  def top_is_pointwise(self):
+    return True
+
+  @property
+  def targets_weights_fn(self):
+    weights_fn = common_layers.weights_nonzero
+
+    hp = self._model_hparams
+    if hp and hp.prepend_mode != "none":
+      assert (hp.prepend_mode == "prepend_inputs_masked_attention" or
+              hp.prepend_mode == "prepend_inputs_full_attention")
+
+      if (
+          # In masked attention mode, during training, the network try to
+          # autoregressively predicting the inputs portion, while the
+          # evaluation is only done on the output
+          hp.prepend_mode != "prepend_inputs_masked_attention" or
+          hp.mode != tf.estimator.ModeKeys.TRAIN):
+        weights_fn = common_layers.weights_prepend_inputs_to_targets
+
+    return weights_fn
+
+  def _get_weights(self, hidden_dim=None):
+    """Create or get concatenated embedding or softmax variable.
+
+    Args:
+      hidden_dim: dim of the variable. Defaults to self._body_input_depth
+
+    Returns:
+       a list of self._num_shards Tensors.
+    """
+    if hidden_dim is None:
+      hidden_dim = self._body_input_depth
+    num_shards = self._model_hparams.symbol_modality_num_shards
+    shards = []
+    for i in range(num_shards):
+      shard_size = (self._vocab_size // num_shards) + (
+          1 if i < self._vocab_size % num_shards else 0)
+      var_name = "weights_%d" % i
+      shards.append(
+          tf.get_variable(
+              var_name, [shard_size, hidden_dim],
+              initializer=tf.random_normal_initializer(0.0, hidden_dim**-0.5)))
+    if num_shards == 1:
+      ret = shards[0]
+    else:
+      ret = tf.concat(shards, 0)
+    # Convert ret to tensor.
+    if not tf.contrib.eager.in_eager_mode():
+      ret = common_layers.convert_gradient_to_tensor(ret)
+    return ret
+
+  def bottom_simple(self, x, name, reuse):
+    with tf.variable_scope(name, reuse=reuse):
+      # Ensure the inputs are 3-D
+      if len(x.get_shape()) == 4:
+        x = tf.squeeze(x, axis=3)
+      while len(x.get_shape()) < 3:
+        x = tf.expand_dims(x, axis=-1)
+
+      var = self._get_weights()
+      x = common_layers.dropout_no_scaling(
+          x, 1.0 - self._model_hparams.symbol_dropout)
+      ret = common_layers.gather(var, x)
+      if self._model_hparams.multiply_embedding_mode == "sqrt_depth":
+        ret *= self._body_input_depth**0.5
+      ret *= tf.expand_dims(tf.to_float(tf.not_equal(x, 0)), -1)
+      return ret
+
+  def bottom(self, x):
+    if (self._model_hparams.shared_embedding_and_softmax_weights or
+        self._model_hparams.get("shared_embedding")):
+      return self.bottom_simple(x, "shared", reuse=None)
+    return self.bottom_simple(x, "input_emb", reuse=None)
+
+  def targets_bottom(self, x):
+    if (self._model_hparams.shared_embedding_and_softmax_weights or
+        self._model_hparams.get("shared_embedding")):
+      try:
+        return self.bottom_simple(x, "shared", reuse=True)
+      except ValueError:
+        # perhaps there were no inputs, and this is a new variable.
+        return self.bottom_simple(x, "shared", reuse=None)
+    else:
+      return self.bottom_simple(x, "target_emb", reuse=None)
+
+  def top(self, body_output, _):
+    """Generate logits.
+
+    Args:
+      body_output: A Tensor with shape [batch, p0, p1, body_input_depth]
+    Returns:
+      logits: A Tensor with shape  [batch, p0, p1, ?, vocab_size].
+    """
+    if self._model_hparams.symbol_modality_skip_top:
+      return tf.expand_dims(body_output, 3)
+
+    if self._model_hparams.shared_embedding_and_softmax_weights:
+      scope_name = "shared"
+      reuse = tf.AUTO_REUSE
+    else:
+      scope_name = "softmax"
+      reuse = False
+
+    with tf.variable_scope(scope_name, reuse=reuse):
+      body_output_shape = common_layers.shape_list(body_output)
+      var = self._get_weights(body_output_shape[-1])
+      if (self._model_hparams.factored_logits and
+          self._model_hparams.mode == tf.estimator.ModeKeys.TRAIN):
+        # insert channels dimension
+        body_output = tf.expand_dims(body_output, 3)
+        return common_layers.FactoredTensor(body_output, var)
+      else:
+        body_output = tf.reshape(body_output, [-1, body_output_shape[-1]])
+        logits = tf.matmul(body_output, var, transpose_b=True)
+        return tf.reshape(logits,
+                          body_output_shape[:-1] + [1, self._vocab_size])
+
+
+class RealL2LossModality(modality.Modality):
+  """Modality for real (i.e. float) vectors with L2 (Gaussian) loss."""
+  
+  @property
+  def top_is_pointwise(self):
+    return True
+
+  def bottom(self, x):
+    with tf.variable_scope("real"):
+      return tf.layers.dense(
+          tf.to_float(x), self._body_input_depth, name="bottom")
+
+  def top(self, body_output, _):
+    with tf.variable_scope("real"):
+      output = tf.layers.dense(body_output, self._vocab_size, name="top")
+      print(output)
+      return output
+
+  def loss(self, top_out, targets):
+    predictions = top_out
+    if (len(common_layers.shape_list(top_out)) != len(
+        common_layers.shape_list(targets))):
+      predictions = tf.squeeze(top_out, axis=[-1])
+    with tf.name_scope("l2"):
+      weights = self.targets_weights_fn(targets)
+      l2 = tf.pow(predictions - targets, 2)
+      return tf.reduce_sum(l2 * weights), tf.reduce_sum(weights)
 
 
 class Text2ScoreProblem(text_problems.Text2TextProblem):
@@ -77,8 +239,8 @@ class Text2ScoreProblem(text_problems.Text2TextProblem):
 
   def hparams(self, defaults, unused_model_hparams):
     p = defaults
-    p.modality = {"inputs": modalities.SymbolModality,
-                  "targets": modalities.RealL2LossModality}
+    p.modality = {"inputs": SymbolModality,
+                  "targets": RealL2LossModality}
     p.vocab_size = {"inputs": self._encoders["inputs"].vocab_size,
                     "targets": self.max_score}
 
@@ -174,9 +336,3 @@ class Clinical(TextSimilarityProblem):
       filename = os.path.join(data_dir, f)
       for example in self.example_generator(filename):
         yield example
-
-  def eval_metrics(self):
-    eval_metrics = [
-      metrics.Metrics.PEARSON
-    ]
-    return eval_metrics
