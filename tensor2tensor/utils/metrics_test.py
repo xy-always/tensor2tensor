@@ -331,6 +331,8 @@ class MetricsTest(tf.test.TestCase):
       session.run(tf.global_variables_initializer())
       session.run(tf.local_variables_initializer())
       actual = session.run(pearson)
+    print(actual)
+    print(expected)
     self.assertAlmostEqual(actual, expected)
 
 if __name__ == '__main__':
