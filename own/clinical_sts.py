@@ -13,10 +13,12 @@ from tensor2tensor.data_generators import generator_utils
 from tensor2tensor.data_generators import problem
 from tensor2tensor.data_generators import text_problems
 from tensor2tensor.data_generators import text_encoder
+from tensor2tensor.layers import common_layers
 from tensor2tensor.utils import modality
 from tensor2tensor.utils import metrics
 from tensor2tensor.utils import mlperf_log
 from tensor2tensor.utils import registry
+
 
 import tensorflow as tf
 
@@ -169,7 +171,9 @@ class RealL2LossModality(modality.Modality):
   def top(self, body_output, _):
     with tf.variable_scope("real"):
       output = tf.layers.dense(body_output, self._vocab_size, name="top")
+      print('FINAL OUTPUT')
       print(output)
+      print('FINAL OUTPUT END')
       return output
 
   def loss(self, top_out, targets):
